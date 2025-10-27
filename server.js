@@ -11,7 +11,11 @@ const {
     shufflePlayers,
     getCurrentPlayer,
     nextTurn,
-    generateRoomId
+    generateRoomId,
+    shouldAiPlay,
+    checkRoundComplete,
+    advanceRound,
+    isGameFinished
 } = require('./rooms');
 const { addTwist, sanitizeContent } = require('./ai');
 
@@ -24,13 +28,36 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
-// Create room
+// Create room with settings
 app.post('/rooms', (req, res) => {
     try {
         const roomId = req.body?.roomId || generateRoomId();
         const creator = req.body?.creator || null;
-        const room = createRoom(roomId, creator);
-        return res.status(201).json({ room });
+
+        // Extract settings
+        const settings = {
+            maxRounds: req.body?.max_rounds || req.body?.maxRounds || 5,
+            aiMode: req.body?.ai_mode || req.body?.aiMode || 'manual_only'
+        };
+
+        // Validate aiMode
+        const validAiModes = ['every_round', 'every_2_rounds', 'manual_only'];
+        if (!validAiModes.includes(settings.aiMode)) {
+            return res.status(400).json({ error: `ai_mode must be one of: ${validAiModes.join(', ')}` });
+        }
+
+        const room = createRoom(roomId, creator, settings);
+
+        // Return formatted response matching the user story
+        return res.status(201).json({
+            room_code: room.id,
+            creator: creator?.name || 'Anonymous',
+            max_rounds: room.maxRounds,
+            ai_mode: room.aiMode,
+            participants: room.players.map(p => p.name),
+            current_round: room.currentRound,
+            room: room // Include full room object
+        });
     } catch (err) {
         return res.status(400).json({ error: err.message });
     }
@@ -51,7 +78,16 @@ app.post('/rooms/:roomId/join', (req, res) => {
             return res.status(400).json({ error: 'Player { id?, name } required' });
         }
         const room = joinRoom(req.params.roomId, player);
-        return res.json({ room });
+
+        // Return formatted response matching the user story
+        return res.json({
+            room_code: room.id,
+            participants: room.players.map(p => p.name),
+            max_rounds: room.maxRounds,
+            current_round: room.currentRound,
+            ai_mode: room.aiMode,
+            room: room // Include full room object
+        });
     } catch (err) {
         return res.status(400).json({ error: err.message });
     }
@@ -94,7 +130,7 @@ app.get('/rooms/:roomId/story', (req, res) => {
     return res.json({ story: room.story });
 });
 
-// Add story part (turn-based)
+// Add story part (turn-based with round logic)
 app.post('/rooms/:roomId/story', (req, res) => {
     try {
         const { playerId, content } = req.body || {};
@@ -104,21 +140,49 @@ app.post('/rooms/:roomId/story', (req, res) => {
         const roomId = req.params.roomId;
         const room = getRoom(roomId);
         if (!room) return res.status(404).json({ error: 'Room not found' });
+
+        // Check if game is finished
+        if (isGameFinished(roomId)) {
+            return res.status(400).json({ error: 'Game is finished' });
+        }
+
         const currentPlayer = getCurrentPlayer(roomId);
         if (!currentPlayer || currentPlayer.id !== playerId) {
             return res.status(403).json({ error: 'Not your turn' });
         }
+
         const sanitized = sanitizeContent(content.trim());
         const storyPart = {
             type: 'story_part',
             content: sanitized,
             author: currentPlayer.name,
             authorId: playerId,
+            round: room.currentRound,
             timestamp: new Date().toISOString()
         };
         room.story.push(storyPart);
-        const nextPlayer = nextTurn(roomId);
-        return res.status(201).json({ storyPart, room, nextPlayer });
+
+        // Check if round is complete
+        const roundResult = advanceRound(roomId);
+
+        const response = {
+            sender: currentPlayer.name,
+            message: sanitized,
+            round: room.currentRound,
+            ai_message: false,
+            storyPart,
+            room,
+            roundComplete: roundResult.finished !== undefined ? roundResult.finished : checkRoundComplete(roomId),
+            shouldAiPlay: shouldAiPlay(roomId)
+        };
+
+        // If game finished, add special flag
+        if (roundResult.finished) {
+            response.type = 'story_finished';
+            response.story = room.story;
+        }
+
+        return res.status(201).json(response);
     } catch (err) {
         return res.status(400).json({ error: err.message });
     }
